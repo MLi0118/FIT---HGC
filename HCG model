@@ -1,0 +1,495 @@
+import learn as learn
+import pandas as pandas
+import torch
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
+
+from sympy.stats.sampling.sample_numpy import numpy
+
+
+import math
+import random
+from dataclasses import dataclass
+from typing import Tuple, Dict, List
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from sklearn.metrics import average_precision_score, roc_auc_score
+from torch_geometric.data import HeteroData
+from torch_geometric.nn import HGTConv
+
+# -----------------------------
+# Config
+# -----------------------------
+@dataclass
+class CFG:
+    data_dir: str = "./data"  # folder where your CSVs live
+    company_csv: str = "company.csv"
+    supplier_csv: str = "supplier.csv"
+    acquirer_hist_csv: str = "acquirer_history.csv"
+    future_deals_csv: str = "future_deals.csv"
+
+    d_hidden: int = 128
+    n_layers_hgt: int = 2
+    n_heads: int = 4
+    dropout: float = 0.25
+
+    lr: float = 3e-4
+    weight_decay: float = 1e-2
+    epochs: int = 20
+    batch_pairs: int = 1024
+    neg_pos_ratio: int = 20  # how many negatives per positive
+
+    seed: int = 42
+
+cfg = CFG()
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# -----------------------------
+# Utils
+# -----------------------------
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def zscore(x: np.ndarray) -> np.ndarray:
+    mu = np.mean(x, axis=0, keepdims=True)
+    sigma = np.std(x, axis=0, keepdims=True) + 1e-8
+    return (x - mu) / sigma
+
+
+# -----------------------------
+# Data loading
+# -----------------------------
+def load_companies(path: str) -> Tuple[torch.Tensor, Dict[int, int]]:
+    """
+    company.csv format (example):
+
+    company_id,name,sector,region,revenue_musd,ebitda_margin,leverage_ratio,growth_rate
+    0,Alpha Tech,Software,North America,120,0.25,1.2,0.15
+    1,Beta Motors,Automotive,Europe,450,0.12,2.3,0.04
+
+    For simplicity: all columns EXCEPT 'company_id' and 'name' are treated as numeric.
+    So encode sector/region numerically yourself (e.g. 0/1/2... or one-hot).
+    """
+    df = pd.read_csv(path)
+    if "company_id" not in df.columns:
+        raise ValueError("company.csv must have a 'company_id' column.")
+
+    df = df.sort_values("company_id").reset_index(drop=True)
+    company_ids = df["company_id"].values
+    id_to_idx = {cid: i for i, cid in enumerate(company_ids)}
+
+    # select numeric feature columns
+    feat_cols = [c for c in df.columns if c not in ("company_id", "name")]
+    X = df[feat_cols].astype(float).values
+    X = zscore(X)
+    x_tensor = torch.tensor(X, dtype=torch.float)
+    return x_tensor, id_to_idx
+
+
+def load_edges_company_to_company(path: str,
+                                  src_col: str,
+                                  dst_col: str,
+                                  id_to_idx: Dict[int, int]) -> torch.Tensor:
+
+    df = pd.read_csv(path)
+    if src_col not in df.columns or dst_col not in df.columns:
+        raise ValueError(f"{path} must contain '{src_col}' and '{dst_col}' columns.")
+
+    src_ids = df[src_col].values
+    dst_ids = df[dst_col].values
+
+    # Map to indices
+    src_idx = []
+    dst_idx = []
+    for s, d in zip(src_ids, dst_ids):
+        if s not in id_to_idx or d not in id_to_idx:
+            # Skip edges with unknown companies
+            continue
+        src_idx.append(id_to_idx[s])
+        dst_idx.append(id_to_idx[d])
+
+    edge_index = torch.tensor([src_idx, dst_idx], dtype=torch.long)
+    return edge_index
+
+
+def load_future_deals(path: str,
+                      id_to_idx: Dict[int, int]) -> torch.Tensor:
+
+    df = pd.read_csv(path)
+    if "acquirer_id" not in df.columns or "target_id" not in df.columns:
+        raise ValueError("future_deals.csv must contain 'acquirer_id' and 'target_id' columns.")
+
+    if "label" in df.columns:
+        df = df[df["label"] == 1].copy()
+
+    src_ids = df["acquirer_id"].values
+    dst_ids = df["target_id"].values
+
+    src_idx = []
+    dst_idx = []
+    for s, d in zip(src_ids, dst_ids):
+        if s not in id_to_idx or d not in id_to_idx:
+            continue
+        src_idx.append(id_to_idx[s])
+        dst_idx.append(id_to_idx[d])
+
+    if len(src_idx) == 0:
+        raise ValueError("No valid positive pairs in future_deals.csv after mapping IDs.")
+
+    pos_pairs = torch.tensor([src_idx, dst_idx], dtype=torch.long)
+    return pos_pairs
+
+
+# -----------------------------
+# Graph building and pairs
+# -----------------------------
+def build_hetero_graph(cfg: CFG) -> Tuple[HeteroData, torch.Tensor, torch.Tensor]:
+
+    base = cfg.data_dir.rstrip("/")
+
+    # 1) Companies
+    x_company, id_to_idx = load_companies(f"{base}/{cfg.company_csv}")
+    num_companies = x_company.size(0)
+    print(f"Loaded {num_companies} companies.")
+
+    data = HeteroData()
+    data["company"].x = x_company
+
+    # 2) Supplier edges
+    edge_sup = load_edges_company_to_company(
+        f"{base}/{cfg.supplier_csv}",
+        src_col="supplier_id",
+        dst_col="customer_id",
+        id_to_idx=id_to_idx,
+    )
+    data["company", "supplier", "company"].edge_index = edge_sup
+    print(f"Loaded {edge_sup.size(1)} supplier edges.")
+
+    # 3) Acquirer history edges (past M&A)
+    edge_acq = load_edges_company_to_company(
+        f"{base}/{cfg.acquirer_hist_csv}",
+        src_col="acquirer_id",
+        dst_col="target_id",
+        id_to_idx=id_to_idx,
+    )
+    data["company", "acquirer", "company"].edge_index = edge_acq
+    print(f"Loaded {edge_acq.size(1)} past M&A (acquirer) edges.")
+
+    # 4) Future deals -> positive pairs
+    pos_pairs = load_future_deals(f"{base}/{cfg.future_deals_csv}", id_to_idx=id_to_idx)
+    num_pos = pos_pairs.size(1)
+    print(f"Loaded {num_pos} positive future M&A pairs.")
+
+    # 5) Negative sampling (random plausible pairs)
+    num_neg = cfg.neg_pos_ratio * num_pos
+    neg_src = []
+    neg_dst = []
+
+    pos_set = set((int(a), int(b)) for a, b in pos_pairs.t().tolist())
+    attempts = 0
+    max_attempts = num_neg * 10
+
+    while len(neg_src) < num_neg and attempts < max_attempts:
+        a = random.randint(0, num_companies - 1)
+        b = random.randint(0, num_companies - 1)
+        attempts += 1
+        if a == b:
+            continue
+        if (a, b) in pos_set:
+            continue
+        neg_src.append(a)
+        neg_dst.append(b)
+
+    if len(neg_src) < num_neg:
+        print(f"[WARN] Only sampled {len(neg_src)} negatives (target {num_neg}).")
+
+    neg_pairs = torch.tensor([neg_src, neg_dst], dtype=torch.long)
+
+    # Concatenate positives and negatives
+    pairs = torch.cat([pos_pairs, neg_pairs], dim=1)
+    labels = torch.cat([torch.ones(num_pos), torch.zeros(len(neg_src))], dim=0)
+
+    return data, pairs, labels
+
+
+# -----------------------------
+# Model: 2-layer HGT + decoder
+# -----------------------------
+class HGTEncoder(nn.Module):
+    def __init__(self, metadata, hidden=128, layers=2, heads=4, dropout=0.25):
+        super().__init__()
+        self.metadata = metadata
+        self.d = hidden
+        self.dropout = nn.Dropout(dropout)
+        self.act = nn.ReLU()
+
+        # Lazy per-type projection: here only "company" exists, but we keep it generic
+        self._in = nn.ModuleDict({ntype: nn.Identity() for ntype in metadata[0]})
+        self._adapters = nn.ModuleDict()
+
+        self.convs = nn.ModuleList([
+            HGTConv(in_channels=hidden, out_channels=hidden,
+                    metadata=metadata, heads=heads)
+            for _ in range(layers)
+        ])
+
+    def _ensure_adapters(self, x_dict: Dict[str, torch.Tensor]):
+        for ntype, x in x_dict.items():
+            if isinstance(self._in[ntype], nn.Identity) and x.size(-1) != self.d:
+                lin = nn.Linear(x.size(-1), self.d)
+                self._adapters[ntype] = lin
+                self._in[ntype] = lin
+
+    def forward(self, x_dict, edge_index_dict):
+        self._ensure_adapters(x_dict)
+        h = {nt: self._in[nt](x) for nt, x in x_dict.items()}
+
+        for conv in self.convs:
+            h = conv(h, edge_index_dict)
+            h = {nt: self.dropout(self.act(h_nt)) for nt, h_nt in h.items()}
+
+        return h
+
+
+class PairDecoder(nn.Module):
+  
+    def __init__(self, hidden=128, meta_dim=0):
+        super().__init__()
+        in_dim = hidden * 3 + meta_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, h_a, h_b, meta=None):
+        if meta is None:
+            meta = torch.zeros(h_a.size(0), 0, device=h_a.device)
+        z = torch.cat([h_a, h_b, h_a * h_b, meta], dim=-1)
+        return self.mlp(z).squeeze(-1)
+
+
+# -----------------------------
+# Training / evaluation
+# -----------------------------
+def split_pairs(pairs: torch.Tensor,
+                labels: torch.Tensor,
+                train_ratio=0.7,
+                val_ratio=0.15):
+    idx = torch.randperm(pairs.size(1))
+    pairs = pairs[:, idx]
+    labels = labels[idx]
+
+    n = pairs.size(1)
+    n_train = int(train_ratio * n)
+    n_val = int(val_ratio * n)
+    n_test = n - n_train - n_val
+
+    train_pairs = pairs[:, :n_train]
+    train_labels = labels[:n_train]
+
+    val_pairs = pairs[:, n_train:n_train + n_val]
+    val_labels = labels[n_train:n_train + n_val]
+
+    test_pairs = pairs[:, n_train + n_val:]
+    test_labels = labels[n_train + n_val:]
+
+    return (train_pairs, train_labels,
+            val_pairs, val_labels,
+            test_pairs, test_labels)
+
+
+def pr_auc_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> float:
+    probs = torch.sigmoid(logits).detach().cpu().numpy()
+    y = labels.detach().cpu().numpy().astype(int)
+    if len(np.unique(y)) == 1:
+        return 0.0
+    return float(average_precision_score(y, probs))
+
+
+def roc_auc_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> float:
+    probs = torch.sigmoid(logits).detach().cpu().numpy()
+    y = labels.detach().cpu().numpy().astype(int)
+    if len(np.unique(y)) == 1:
+        return 0.5
+    return float(roc_auc_score(y, probs))
+
+
+def train_epoch(encoder, decoder, data, pairs, labels, cfg: CFG) -> float:
+    encoder.train()
+    decoder.train()
+
+    opt = torch.optim.AdamW(
+        list(encoder.parameters()) + list(decoder.parameters()),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
+
+    N = pairs.size(1)
+    bsz = cfg.batch_pairs
+    perm = torch.randperm(N)
+    total_loss = 0.0
+
+    for i in range(0, N, bsz):
+        idx = perm[i:i + bsz]
+        batch_pairs = pairs[:, idx]
+        batch_labels = labels[idx].to(DEVICE)
+
+        # Encode whole graph (simple but fine for mid-sized graphs)
+        h = encoder(
+            {"company": data["company"].x.to(DEVICE)},
+            {
+                ("company", "supplier", "company"): data["company", "supplier", "company"].edge_index.to(DEVICE),
+                ("company", "acquirer", "company"): data["company", "acquirer", "company"].edge_index.to(DEVICE),
+            },
+        )
+
+        h_comp = h["company"]
+        a_idx, b_idx = batch_pairs[0].to(DEVICE), batch_pairs[1].to(DEVICE)
+        h_a = h_comp[a_idx]
+        h_b = h_comp[b_idx]
+
+        logits = decoder(h_a, h_b, meta=None)
+
+        pos_weight = torch.tensor([cfg.neg_pos_ratio], device=DEVICE)
+        loss = F.binary_cross_entropy_with_logits(logits, batch_labels, pos_weight=pos_weight)
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        total_loss += loss.item() * batch_labels.size(0)
+
+    return total_loss / N
+
+
+@torch.no_grad()
+def evaluate_model(encoder, decoder, data, pairs, labels) -> Tuple[float, float]:
+    encoder.eval()
+    decoder.eval()
+
+    h = encoder(
+        {"company": data["company"].x.to(DEVICE)},
+        {
+            ("company", "supplier", "company"): data["company", "supplier", "company"].edge_index.to(DEVICE),
+            ("company", "acquirer", "company"): data["company", "acquirer", "company"].edge_index.to(DEVICE),
+        },
+    )
+    h_comp = h["company"]
+
+    a_idx, b_idx = pairs[0].to(DEVICE), pairs[1].to(DEVICE)
+    h_a = h_comp[a_idx]
+    h_b = h_comp[b_idx]
+
+    logits = decoder(h_a, h_b, meta=None)
+    pr = pr_auc_from_logits(logits, labels)
+    roc = roc_auc_from_logits(logits, labels)
+    return pr, roc
+
+
+@torch.no_grad()
+def rank_targets_for_company(encoder, decoder, data, company_idx: int, topk: int = 10):
+    """
+    Ranks all other companies as potential targets for a given acquirer (by index).
+    """
+    encoder.eval()
+    decoder.eval()
+
+    h = encoder(
+        {"company": data["company"].x.to(DEVICE)},
+        {
+            ("company", "supplier", "company"): data["company", "supplier", "company"].edge_index.to(DEVICE),
+            ("company", "acquirer", "company"): data["company", "acquirer", "company"].edge_index.to(DEVICE),
+        },
+    )
+    h_comp = h["company"]
+
+    num_companies = h_comp.size(0)
+    candidates = [i for i in range(num_companies) if i != company_idx]
+
+    a_idx = torch.full((len(candidates),), company_idx, dtype=torch.long, device=DEVICE)
+    b_idx = torch.tensor(candidates, dtype=torch.long, device=DEVICE)
+
+    h_a = h_comp[a_idx]
+    h_b = h_comp[b_idx]
+
+    logits = decoder(h_a, h_b, meta=None)
+    probs = torch.sigmoid(logits).detach().cpu().numpy()
+
+    order = np.argsort(-probs)[:topk]
+    ranked = [(int(candidates[i]), float(probs[i])) for i in order]
+    return ranked
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    print(f"Using device: {DEVICE}")
+    set_seed(cfg.seed)
+
+    # 1) Build graph and labeled pairs
+    data, pairs, labels = build_hetero_graph(cfg)
+
+    # 2) Train/val/test split
+    (pairs_tr, y_tr,
+     pairs_val, y_val,
+     pairs_te, y_te) = split_pairs(pairs, labels, train_ratio=0.7, val_ratio=0.15)
+
+    print(f"Train pairs: {pairs_tr.size(1)}, Val pairs: {pairs_val.size(1)}, Test pairs: {pairs_te.size(1)}")
+
+    # 3) Init model
+    metadata = data.metadata()
+    encoder = HGTEncoder(metadata,
+                         hidden=cfg.d_hidden,
+                         layers=cfg.n_layers_hgt,
+                         heads=cfg.n_heads,
+                         dropout=cfg.dropout).to(DEVICE)
+    decoder = PairDecoder(hidden=cfg.d_hidden, meta_dim=0).to(DEVICE)
+
+    best_val_pr = -1.0
+    best_state = None
+
+    # 4) Training loop
+    for epoch in range(1, cfg.epochs + 1):
+        loss = train_epoch(encoder, decoder, data, pairs_tr, y_tr, cfg)
+        val_pr, val_roc = evaluate_model(encoder, decoder, data, pairs_val, y_val)
+        print(f"Epoch {epoch:02d} | loss={loss:.4f} | val PR-AUC={val_pr:.4f} | val ROC-AUC={val_roc:.4f}")
+
+        if val_pr > best_val_pr:
+            best_val_pr = val_pr
+            best_state = {
+                "encoder": encoder.state_dict(),
+                "decoder": decoder.state_dict()
+            }
+
+    # 5) Load best and test
+    if best_state is not None:
+        encoder.load_state_dict(best_state["encoder"])
+        decoder.load_state_dict(best_state["decoder"])
+
+    test_pr, test_roc = evaluate_model(encoder, decoder, data, pairs_te, y_te)
+    print(f"\nTEST PR-AUC: {test_pr:.4f} | TEST ROC-AUC: {test_roc:.4f}")
+
+    # 6) Example: rank targets for company 0
+    example_acquirer = 0
+    ranked = rank_targets_for_company(encoder, decoder, data, company_idx=example_acquirer, topk=10)
+    print(f"\nTop-10 predicted targets for company index {example_acquirer}:")
+    for idx, (target_idx, prob) in enumerate(ranked, start=1):
+        print(f"{idx:2d}. target_idx={target_idx} | s_M&A={prob:.4f}")
+
+
+if __name__ == "__main__":
+    main()
